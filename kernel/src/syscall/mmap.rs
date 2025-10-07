@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! This mod defines mmap flags and the handler to syscall mmap
+//! Implements the `mmap` syscall for a kernel. This allows user processes
+//! to map files or anonymous memory into their virtual address space.
 
 use align_ext::AlignExt;
 use aster_rights::Rights;
@@ -12,6 +13,15 @@ use crate::{
     vm::{perms::VmPerms, vmar::is_userspace_vaddr, vmo::VmoOptions},
 };
 
+/// Entry point for the mmap system call.
+/// Parameters correspond to the standard Linux `mmap` syscall:
+/// - `addr`: Suggested start address of the mapping.
+/// - `len`: Length of the mapping.
+/// - `perms`: Protection bits (PROT_READ/WRITE/EXEC).
+/// - `flags`: Mapping flags (MAP_SHARED, MAP_ANONYMOUS, etc.).
+/// - `fd`: File descriptor (if mapping a file).
+/// - `offset`: Offset in the file to map from.
+/// - `ctx`: Process/thread context.
 pub fn sys_mmap(
     addr: u64,
     len: u64,
@@ -21,8 +31,11 @@ pub fn sys_mmap(
     offset: u64,
     ctx: &Context,
 ) -> Result<SyscallReturn> {
+    // Convert numeric flags/perms into typed enums/bitflags.
     let perms = VmPerms::from_bits_truncate(perms as u32);
     let option = MMapOptions::try_from(flags as u32)?;
+    
+    // Delegate actual logic to `do_sys_mmap`.
     let res = do_sys_mmap(
         addr as usize,
         len as usize,
@@ -35,6 +48,10 @@ pub fn sys_mmap(
     Ok(SyscallReturn::Return(res as _))
 }
 
+/// The core logic of the mmap syscall.
+/// This function validates parameters, prepares a mapping, and
+/// creates a `VMO` (virtual memory object) backed by either
+/// anonymous memory or a file.
 fn do_sys_mmap(
     addr: Vaddr,
     len: usize,
@@ -49,12 +66,15 @@ fn do_sys_mmap(
         addr, len, vm_perms, option, fd, offset
     );
 
+    // MAP_FIXED_NOREPLACE implies MAP_FIXED (per POSIX)
     if option.flags.contains(MMapFlags::MAP_FIXED_NOREPLACE) {
         option.flags.insert(MMapFlags::MAP_FIXED);
     }
 
+    // Basic validation of flags and address.
     check_option(addr, len, &option)?;
 
+    // Validate length and prevent overflow issues.
     if len == 0 {
         return_errno_with_message!(Errno::EINVAL, "mmap len cannot be zero");
     }
@@ -62,21 +82,24 @@ fn do_sys_mmap(
         return_errno_with_message!(Errno::ENOMEM, "mmap len too large");
     }
 
+    // Round length up to page size.
     let len = len.align_up(PAGE_SIZE);
 
+    // Offsets must be page-aligned.
     if offset % PAGE_SIZE != 0 {
         return_errno_with_message!(Errno::EINVAL, "mmap only support page-aligned offset");
     }
+    // Prevent integer overflow on offset + len.
     offset.checked_add(len).ok_or(Error::with_message(
         Errno::EOVERFLOW,
         "integer overflow when (offset + len)",
     ))?;
+    // Prevent addr + len overflow.
     if addr > isize::MAX as usize - len {
         return_errno_with_message!(Errno::ENOMEM, "mmap (addr + len) too large");
     }
 
     // On x86, `PROT_WRITE` implies `PROT_READ`.
-    // <https://man7.org/linux/man-pages/man2/mmap.2.html>
     #[cfg(target_arch = "x86_64")]
     let vm_perms = if !vm_perms.contains(VmPerms::READ) && vm_perms.contains(VmPerms::WRITE) {
         vm_perms | VmPerms::READ
@@ -86,22 +109,29 @@ fn do_sys_mmap(
 
     let mut vm_may_perms = VmPerms::ALL_MAY_PERMS;
 
+    // Retrieve the current process's root VMAR (Virtual Memory Address Region).
     let user_space = ctx.user_space();
     let root_vmar = user_space.root_vmar();
+
+    // Build a new mapping options object.
     let vm_map_options = {
         let mut options = root_vmar.new_map(len, vm_perms)?;
         let flags = option.flags;
+
+        // MAP_FIXED: must map exactly at `addr`
         if flags.contains(MMapFlags::MAP_FIXED) {
             options = options.offset(addr).can_overwrite(true);
         } else if flags.contains(MMapFlags::MAP_32BIT) {
-            // TODO: support MAP_32BIT. MAP_32BIT requires the map range to be below 2GB
+            // TODO: enforce <2GB mapping range for MAP_32BIT
             warn!("MAP_32BIT is not supported");
         }
 
+        // Shared mappings must be marked as such.
         if option.typ() == MMapType::Shared {
             options = options.is_shared(true);
         }
 
+        // Handle anonymous mappings.
         if option.flags.contains(MMapFlags::MAP_ANONYMOUS) {
             if offset != 0 {
                 return_errno_with_message!(
@@ -110,7 +140,7 @@ fn do_sys_mmap(
                 );
             }
 
-            // Anonymous shared mapping should share the same memory pages.
+            // Shared anonymous mapping: share the same backing VMO.
             if option.typ() == MMapType::Shared {
                 let shared_vmo = {
                     let vmo_options: VmoOptions<Rights> = VmoOptions::new(len);
@@ -119,6 +149,7 @@ fn do_sys_mmap(
                 options = options.vmo(shared_vmo);
             }
         } else {
+            // File-backed mapping: get the file and verify permissions.
             let mut file_table = ctx.thread_local.borrow_file_table_mut();
             let file = get_file_fast!(&mut file_table, fd);
 
@@ -133,9 +164,10 @@ fn do_sys_mmap(
                 vm_may_perms.remove(VmPerms::MAY_WRITE);
             }
 
+            // Build mapping options with file-backed VMO.
             options = options
                 .may_perms(vm_may_perms)
-                .mappable(file.mappable()?)
+                .mappable(file.mappable()?) // source: file's memory object
                 .vmo_offset(offset)
                 .handle_page_faults_around();
         }
@@ -143,17 +175,21 @@ fn do_sys_mmap(
         options
     };
 
+    // Finally, create the mapping in the virtual address space.
     let map_addr = vm_map_options.build()?;
 
     Ok(map_addr)
 }
 
+/// Basic validation for mapping options before creating a VMO.
 fn check_option(addr: Vaddr, size: usize, option: &MMapOptions) -> Result<()> {
+    // Type must not be `File` (invalid)
     if option.typ() == MMapType::File {
         return_errno_with_message!(Errno::EINVAL, "Invalid mmap type");
     }
 
     let map_end = addr.checked_add(size).ok_or(Errno::EINVAL)?;
+    // If MAP_FIXED is used, ensure address range is within user space.
     if option.flags().contains(MMapFlags::MAP_FIXED)
         && !(is_userspace_vaddr(addr) && is_userspace_vaddr(map_end - 1))
     {
@@ -163,13 +199,11 @@ fn check_option(addr: Vaddr, size: usize, option: &MMapOptions) -> Result<()> {
     Ok(())
 }
 
-// Definition of MMap flags, conforming to the linux mmap interface:
-// https://man7.org/linux/man-pages/man2/mmap.2.html
-//
-// The first 4 bits of the flag value represents the type of memory map,
-// while other bits are used as memory map flags.
+// -----------------------------------------------------------------------------
+// mmap flag definitions (mostly mirror Linux semantics)
+// -----------------------------------------------------------------------------
 
-// The map type mask
+// Low 4 bits encode the map type (shared/private/etc.)
 const MAP_TYPE: u32 = 0xf;
 
 #[derive(Copy, Clone, PartialEq, Debug, TryFromInt)]
@@ -200,6 +234,7 @@ bitflags! {
     }
 }
 
+/// Struct representing parsed mmap options.
 #[derive(Debug)]
 pub struct MMapOptions {
     typ: MMapType,
